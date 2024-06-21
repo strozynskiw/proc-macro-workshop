@@ -28,6 +28,13 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
     });
 
+    let build_function_assign_fields = fields.iter().map(|f| {
+        let name = &f.ident;
+        quote! {
+            #name: self.#name.take().ok_or_else(|| format!("{} is missing", stringify!(#name)))?,
+        }
+    });
+
     let builder_defaults = fields.iter().map(|f| {
         let name = &f.ident;
         quote! {
@@ -47,6 +54,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
     });
 
     let expanded = quote! {
+        use std::error::Error;
 
         pub struct #builder_name {
             #(#builder_fields)*
@@ -61,6 +69,13 @@ pub fn derive(input: TokenStream) -> TokenStream {
         }
 
         impl #builder_name {
+
+            pub fn build(mut self) -> Result<#name, Box<dyn Error>>  {
+                Ok(#name {
+                    #(#build_function_assign_fields)*
+                })
+            }
+
             #(#builder_methods)*
         }
     };
