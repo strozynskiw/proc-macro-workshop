@@ -70,7 +70,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
         impl #builder_name {
 
-            pub fn build(mut self) -> Result<#name, Box<dyn Error>>  {
+            pub fn build(&mut self) -> Result<#name, Box<dyn Error>>  {
                 Ok(#name {
                     #(#build_function_assign_fields)*
                 })
