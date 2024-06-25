@@ -12,6 +12,7 @@ use derive_builder::Builder;
 pub struct Test {
     string: String,
     vec: Vec<String>,
+    opt: Option<String>,
 }
 
 fn main() {}
