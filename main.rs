@@ -10,8 +10,9 @@ use derive_builder::Builder;
 
 #[derive(Builder)]
 pub struct Test {
-    string: String,
-    vec: Vec<String>,
+    exec: String,
+    #[builder(each = "arg")]
+    args: Vec<String>,
     opt: Option<String>,
 }
 
