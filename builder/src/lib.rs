@@ -1,64 +1,19 @@
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    parse2, parse_macro_input, DeriveInput, GenericArgument, Ident, LitStr, Meta, MetaList,
-    PathArguments, Token, Type,
+    parse2, parse_macro_input, Data, DeriveInput, Fields, GenericArgument, Ident, LitStr, Meta,
+    PathArguments, Token, Type, TypePath,
 };
 
-fn is_option(ty: &Type) -> bool {
-    if let Type::Path(typepath) = ty {
-        if typepath.qself.is_none() && typepath.path.segments.len() == 1 {
-            let segment = &typepath.path.segments[0];
-            if segment.ident == "Option" {
-                if let PathArguments::AngleBracketed(ref args) = segment.arguments {
-                    return args.args.len() == 1;
+fn get_inner_type_of<'a, 'b>(typepath: &'a TypePath, wrapper: &'b str) -> Option<&'a Type> {
+    let segment = &typepath.path.segments[0];
+    if segment.ident == wrapper {
+        if let PathArguments::AngleBracketed(ref args) = segment.arguments {
+            if args.args.len() == 1 {
+                if let GenericArgument::Type(ref inner_ty) = args.args[0] {
+                    return Some(inner_ty);
                 }
             }
-        }
-    }
-    false
-}
-
-fn get_option_inner_type(ty: &Type) -> Option<&Type> {
-    if let Type::Path(typepath) = ty {
-        if typepath.qself.is_none() && typepath.path.segments.len() == 1 {
-            let segment = &typepath.path.segments[0];
-            if segment.ident == "Option" {
-                if let PathArguments::AngleBracketed(ref args) = segment.arguments {
-                    if args.args.len() == 1 {
-                        if let GenericArgument::Type(ref inner_ty) = args.args[0] {
-                            return Some(inner_ty);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn get_vec_inner_type(ty: &Type) -> Option<&Type> {
-    if let Type::Path(typepath) = ty {
-        if typepath.qself.is_none() && typepath.path.segments.len() == 1 {
-            let segment = &typepath.path.segments[0];
-            if segment.ident == "Vec" {
-                if let PathArguments::AngleBracketed(ref args) = segment.arguments {
-                    if args.args.len() == 1 {
-                        if let GenericArgument::Type(ref inner_ty) = args.args[0] {
-                            return Some(inner_ty);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-fn is_builder_of(f: &syn::Field) -> Option<&syn::Attribute> {
-    for attr in &f.attrs {
-        if attr.path().segments.len() == 1 && attr.path().segments[0].ident == "builder" {
-            return Some(attr);
         }
     }
     None
@@ -67,90 +22,125 @@ fn is_builder_of(f: &syn::Field) -> Option<&syn::Attribute> {
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
-
     let name = input.ident;
     let builder_name = syn::Ident::new(&format!("{}Builder", name), name.span());
 
     // Iterate through the fields of the struct
-    let fields = if let syn::Data::Struct(syn::DataStruct {
-        fields: syn::Fields::Named(syn::FieldsNamed { ref named, .. }),
-        ..
-    }) = input.data
-    {
-        named
-    } else {
-        unimplemented!();
+    let Data::Struct(data_struct) = &input.data else {
+        return syn::Error::new_spanned(name, format!("invalid derive type"))
+            .to_compile_error()
+            .into();
     };
 
-    let builder_fields = fields.iter().map(|f| {
-        let name = &f.ident;
-        let ty = &f.ty;
+    let Fields::Named(named_fields) = &data_struct.fields else {
+        return syn::Error::new_spanned(name, format!("expected named fields"))
+            .to_compile_error()
+            .into();
+    };
 
-        if is_option(&ty) || is_builder_of(&f).is_some() && get_each_value(f).is_none() {
-            quote! {
+    let mut builder_fields: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut build_function_assign_fields: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut builder_defaults: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut builder_methods: Vec<proc_macro2::TokenStream> = Vec::new();
+
+    for field in &named_fields.named {
+        let mut each: Option<Ident> = None;
+        // Attributes like `#[builder(each = "arg")]` are parsed here
+        for attr in &field.attrs {
+            let p = attr.meta.path().segments.first();
+            if p.is_none() || p.unwrap().ident != "builder" {
+                continue;
+            }
+
+            // Process actual attributes  from here
+            let Meta::List(meta) = &attr.meta else {
+                continue;
+            };
+
+            let attr_input: AttrInput = parse2(meta.tokens.to_owned()).unwrap();
+
+            if attr_input.ident != "each" {
+                return syn::Error::new_spanned(
+                    meta,
+                    format!("expected `builder(each = \"...\")`"),
+                )
+                .to_compile_error()
+                .into();
+            }
+
+            each = Some(attr_input.value);
+        }
+
+        let name = &field.ident;
+        let ty = &field.ty;
+
+        let Type::Path(path) = ty else { continue };
+
+        if let Some(option_type) = get_inner_type_of(path, "Option") {
+            builder_fields.push(quote! {
                 pub #name: #ty,
-            }
-        } else {
-            quote! {
-                pub #name: Option<#ty>,
-            }
-        }
-    });
+            });
 
-    let build_function_assign_fields = fields.iter().map(|f| {
-        let name = &f.ident;
-        let ty = &f.ty;
-
-     if is_option(&ty) || is_builder_of(&f).is_some() && get_each_value(&f).is_none() {
-            quote! {
+            build_function_assign_fields.push(quote! {
                 #name: self.#name.take(),
+            });
+
+            builder_defaults.push(quote! {
+                #name: core::option::Option::None,
+            });
+
+            builder_methods.push(quote! {
+                pub fn #name(&mut self, #name: #option_type) -> &mut Self {
+                self.#name = core::option::Option::Some(#name);
+                self
+                }
+            });
+        } else if let Some(each) = each {
+            if let Some(vec_type) = get_inner_type_of(path, "Vec") {
+                builder_fields.push(quote! {
+                    pub #name: core::option::Option<#ty>,
+                });
+
+                build_function_assign_fields.push(quote! {
+                    #name: self.#name.take().ok_or_else(|| format!("{} is missing", stringify!(#name)))?,
+                });
+
+                builder_defaults.push(quote! {
+                    #name: core::option::Option::Some(Vec::new()),
+                });
+
+                builder_methods.push(quote! {
+                    pub fn #each(&mut self, item: #vec_type) -> &mut Self {
+                        self.#name.as_mut().map(|v| v.push(item));
+                    self
+                    }
+                });
+            } else {
+                unimplemented!() //put error here
             }
         } else {
-            quote! {
+            builder_fields.push(quote! {
+                pub #name: core::option::Option<#ty>,
+            });
+
+            build_function_assign_fields.push(quote! {
                 #name: self.#name.take().ok_or_else(|| format!("{} is missing", stringify!(#name)))?,
-            }
-        }
-    });
+            });
 
-    let builder_defaults = fields.iter().map(|f| {
-        let name = &f.ident;
+            builder_defaults.push(quote! {
+                #name: core::option::Option::None,
+            });
 
-        if let Some(_) = get_vec_inner_type(&f.ty) {
-            quote! {
-                #name: Some(Vec::new()),
-            }
-        } else {
-            quote! {
-                #name: None,
-            }
-        }
-    });
-
-    let builder_methods = fields.iter().map(|f| {
-        let name = &f.ident;
-        let ty = &f.ty;
-
-        if let Some(each) = get_each_value(f) {
-            let inner = get_vec_inner_type(&ty).unwrap_or(&ty);
-            quote! {
-                pub fn #each(&mut self, item: #inner) -> &mut Self {
-                    self.#name.as_mut().map(|v| v.push(item));
+            builder_methods.push(quote! {
+                pub fn #name(&mut self, #name: #ty) -> &mut Self {
+                self.#name = core::option::Option::Some(#name);
                 self
                 }
-            }
-        } else {
-            let inner = get_option_inner_type(&ty).unwrap_or(&ty);
-            quote! {
-                pub fn #name(&mut self, #name: #inner) -> &mut Self {
-                self.#name = Some(#name);
-                self
-                }
-            }
+            });
         }
-    });
+    }
 
     let expanded = quote! {
-        use std::error::Error;
 
         pub struct #builder_name {
             #(#builder_fields)*
@@ -166,7 +156,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
         impl #builder_name {
 
-            pub fn build(&mut self) -> Result<#name, Box<dyn Error>>  {
+            pub fn build(&mut self) -> core::result::Result<#name, std::boxed::Box<dyn std::error::Error>>  {
                 Ok(#name {
                     #(#build_function_assign_fields)*
                 })
@@ -175,44 +165,22 @@ pub fn derive(input: TokenStream) -> TokenStream {
             #(#builder_methods)*
         }
     };
-
-    proc_macro::TokenStream::from(expanded)
-}
-
-fn get_each_value(f: &syn::Field) -> Option<Ident> {
-    let attr = f.attrs.first()?;
-    let meta = &attr.meta;
-
-    match meta {
-        Meta::List(MetaList {
-            path,
-            delimiter: _,
-            tokens,
-        }) if path.is_ident("builder") => {
-            let each_input: EachInput = parse2(tokens.to_owned()).unwrap();
-            if each_input.each == "each" {
-                Some(each_input.value)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    expanded.into()
 }
 
 #[derive(Debug)]
-struct EachInput {
-    each: Ident,
+struct AttrInput {
+    ident: Ident,
     value: Ident,
 }
 
-impl syn::parse::Parse for EachInput {
+impl syn::parse::Parse for AttrInput {
     fn parse(input: syn::parse::ParseStream) -> syn::Result<Self> {
-        let each: Ident = input.parse()?;
+        let ident: Ident = input.parse()?;
         let _eq_token: Token![=] = input.parse()?;
         let value: LitStr = input.parse()?;
         let value: Ident = Ident::new(value.value().as_str(), value.span());
 
-        Ok(EachInput { each, value })
+        Ok(AttrInput { ident, value })
     }
 }
